@@ -72,98 +72,110 @@ def parse_spots(text: str):
 def make_session_id(title, starts_at, coach):
     return re.sub(r"\W+", "_", f"{title}_{starts_at}_{coach}").lower()[:80]
 
-async def scrape_gym_playwright(gym: dict) -> list:
-    """Scrape a single gym using a real Chromium browser."""
+async def scrape_gym_playwright(browser, gym: dict) -> list:
+    """Scrape a single gym on an existing browser instance (one tab)."""
     sessions = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await browser.new_page(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36"
-        )
+    page = await browser.new_page(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36"
+    )
+    try:
+        log.info(f"[{gym['id']}] Navigating to {gym['url']}")
+        await page.goto(gym["url"], wait_until="networkidle", timeout=45000)
+
+        # Wait for session blocks to appear
+        wait_sel = gym.get("wait_for_selector", gym.get("session_selector", "body"))
         try:
-            log.info(f"[{gym['id']}] Navigating to {gym['url']}")
-            await page.goto(gym["url"], wait_until="networkidle", timeout=45000)
+            await page.wait_for_selector(wait_sel, timeout=20000)
+        except Exception:
+            log.warning(f"[{gym['id']}] Timeout waiting for selector '{wait_sel}'")
 
-            # Wait for session blocks to appear
-            wait_sel = gym.get("wait_for_selector", gym.get("session_selector", "body"))
+        # Extra wait if configured (some sites load lazily)
+        extra_wait = gym.get("extra_wait_ms", 0)
+        if extra_wait:
+            await page.wait_for_timeout(extra_wait)
+
+        blocks = await page.query_selector_all(gym.get("session_selector", ""))
+        log.info(f"[{gym['id']}] Found {len(blocks)} session blocks")
+
+        for block in blocks:
             try:
-                await page.wait_for_selector(wait_sel, timeout=20000)
-            except Exception:
-                log.warning(f"[{gym['id']}] Timeout waiting for selector '{wait_sel}'")
+                s = {
+                    "title": "", "coach": "", "starts_at": "",
+                    "capacity": gym.get("default_capacity"),
+                    "spots_left": None, "is_full": False
+                }
+                for field in ["title", "coach", "starts_at"]:
+                    sel = gym.get(f"{field}_selector")
+                    if sel:
+                        el = await block.query_selector(sel)
+                        s[field] = (await el.inner_text()).strip() if el else ""
 
-            # Extra wait if configured (some sites load lazily)
-            extra_wait = gym.get("extra_wait_ms", 0)
-            if extra_wait:
-                await page.wait_for_timeout(extra_wait)
+                if gym.get("spots_selector"):
+                    el = await block.query_selector(gym["spots_selector"])
+                    if el:
+                        raw = (await el.inner_text()).strip()
+                        parsed = parse_spots(raw)
+                        if parsed is not None:
+                            s["spots_left"] = parsed
+                            s["is_full"] = parsed == 0
 
-            blocks = await page.query_selector_all(gym.get("session_selector", ""))
-            log.info(f"[{gym['id']}] Found {len(blocks)} session blocks")
+                # Fallback: check for full/complet class on the block itself
+                if s["spots_left"] is None and gym.get("full_class"):
+                    has_full_class = await block.evaluate(
+                        f"el => el.classList.contains('{gym['full_class']}')"
+                    )
+                    if has_full_class:
+                        s["spots_left"] = 0
+                        s["is_full"] = True
 
-            for block in blocks:
-                try:
-                    s = {
-                        "title": "", "coach": "", "starts_at": "",
-                        "capacity": gym.get("default_capacity"),
-                        "spots_left": None, "is_full": False
-                    }
-                    for field in ["title", "coach", "starts_at"]:
-                        sel = gym.get(f"{field}_selector")
-                        if sel:
-                            el = await block.query_selector(sel)
-                            s[field] = (await el.inner_text()).strip() if el else ""
+                s["session_id"] = make_session_id(s["title"], s["starts_at"], s["coach"])
 
-                    if gym.get("spots_selector"):
-                        el = await block.query_selector(gym["spots_selector"])
-                        if el:
-                            raw = (await el.inner_text()).strip()
-                            parsed = parse_spots(raw)
-                            if parsed is not None:
-                                s["spots_left"] = parsed
-                                s["is_full"] = parsed == 0
+                # location_filter: only keep sessions matching this string
+                loc_filter = gym.get("location_filter")
+                if loc_filter:
+                    block_text = await block.inner_text()
+                    if loc_filter.lower() not in block_text.lower():
+                        continue
 
-                    # Fallback: check for full/complet class on the block itself
-                    if s["spots_left"] is None and gym.get("full_class"):
-                        has_full_class = await block.evaluate(
-                            f"el => el.classList.contains('{gym['full_class']}')"
-                        )
-                        if has_full_class:
-                            s["spots_left"] = 0
-                            s["is_full"] = True
+                if s["title"] or s["starts_at"]:  # skip empty blocks
+                    sessions.append(s)
+            except Exception as e:
+                log.error(f"[{gym['id']}] Block parse error: {e}")
 
-                    s["session_id"] = make_session_id(s["title"], s["starts_at"], s["coach"])
-
-                    # location_filter: only keep sessions matching this string
-                    loc_filter = gym.get("location_filter")
-                    if loc_filter:
-                        # Check if any text in the block contains the location filter
-                        block_text = await block.inner_text()
-                        if loc_filter.lower() not in block_text.lower():
-                            continue
-
-                    if s["title"] or s["starts_at"]:  # skip empty blocks
-                        sessions.append(s)
-                except Exception as e:
-                    log.error(f"[{gym['id']}] Block parse error: {e}")
-
-        except Exception as e:
-            log.error(f"[{gym['id']}] Page load error: {e}")
-        finally:
-            await browser.close()
+    except Exception as e:
+        log.error(f"[{gym['id']}] Page load error: {e}")
+    finally:
+        await page.close()
 
     return sessions
 
 def scrape_all_gyms():
-    """Run async scraping for all gyms synchronously."""
+    """Run async scraping for all gyms in parallel (single browser, N tabs)."""
     async def _run():
-        results = {}
-        for gym in GYMS:
-            if gym.get("disabled"):
-                log.info(f"[{gym['id']}] Skipped (disabled)")
-                results[gym["id"]] = []
-                continue
-            sessions = await scrape_gym_playwright(gym)
-            results[gym["id"]] = sessions
-        return results
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            try:
+                active = [g for g in GYMS if not g.get("disabled")]
+                for g in GYMS:
+                    if g.get("disabled"):
+                        log.info(f"[{g['id']}] Skipped (disabled)")
+
+                results_list = await asyncio.gather(
+                    *[scrape_gym_playwright(browser, g) for g in active],
+                    return_exceptions=True,
+                )
+                results = {g["id"]: [] for g in GYMS if g.get("disabled")}
+                for gym, res in zip(active, results_list):
+                    if isinstance(res, Exception):
+                        log.error(f"[{gym['id']}] Scrape failed: {res}")
+                        results[gym["id"]] = []
+                    else:
+                        results[gym["id"]] = res
+                return results
+            finally:
+                await browser.close()
     return asyncio.run(_run())
 
 # ── Persistence ───────────────────────────────────────────────────────────────
