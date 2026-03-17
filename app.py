@@ -1,0 +1,296 @@
+"""
+Gym Session Tracker
+Scrapes gym websites, tracks session availability, predicts when sessions will be full,
+and sends email alerts.
+"""
+
+import sqlite3
+import smtplib
+import logging
+import os
+import re
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from pathlib import Path
+
+import httpx
+from bs4 import BeautifulSoup
+from apscheduler.schedulers.background import BackgroundScheduler
+import numpy as np
+from flask import Flask, render_template_string, jsonify
+
+from config import GYMS, EMAIL_CONFIG, ALERT_CONFIG
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "gym_tracker.db"
+
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gym_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            coach TEXT, title TEXT, starts_at TEXT, capacity INTEGER,
+            UNIQUE(gym_id, session_id)
+        );
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gym_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            captured_at TEXT NOT NULL, spots_left INTEGER, is_full INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS alerts_sent (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gym_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            alert_type TEXT NOT NULL, sent_at TEXT NOT NULL
+        );
+    """)
+    con.commit(); con.close()
+    log.info(f"Database ready at {DB_PATH}")
+
+def get_db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36"}
+
+def fetch_html(url):
+    try:
+        r = httpx.get(url, headers=HEADERS, timeout=20, follow_redirects=True)
+        r.raise_for_status()
+        return BeautifulSoup(r.text, "html.parser")
+    except Exception as e:
+        log.error(f"Failed to fetch {url}: {e}")
+        return None
+
+def parse_spots(text):
+    text = text.lower().strip()
+    if any(w in text for w in ["complet", "full", "sold out", "no spots", "0 place"]):
+        return 0
+    m = re.search(r"(\d+)\s*(place|spot|pl|seat)", text)
+    if m: return int(m.group(1))
+    m = re.search(r"(\d+)", text)
+    if m: return int(m.group(1))
+    return None
+
+def make_session_id(title, starts_at, coach):
+    return re.sub(r"\W+", "_", f"{title}_{starts_at}_{coach}").lower()[:80]
+
+def scrape_gym(gym):
+    soup = fetch_html(gym["url"])
+    if not soup: return []
+    selector = gym.get("session_selector", "")
+    if not selector:
+        log.warning(f"No session_selector for {gym['id']}"); return []
+    blocks = soup.select(selector)
+    log.info(f"[{gym['id']}] Found {len(blocks)} blocks")
+    sessions = []
+    for block in blocks:
+        try:
+            s = {"title": "", "coach": "", "starts_at": "", "capacity": gym.get("default_capacity"), "spots_left": None, "is_full": False}
+            for field in ["title", "coach", "starts_at"]:
+                sel = gym.get(f"{field}_selector")
+                if sel:
+                    el = block.select_one(sel)
+                    s[field] = el.get_text(strip=True) if el else ""
+            if gym.get("spots_selector"):
+                el = block.select_one(gym["spots_selector"])
+                if el:
+                    parsed = parse_spots(el.get_text(strip=True))
+                    if parsed is not None:
+                        s["spots_left"] = parsed
+                        s["is_full"] = parsed == 0
+            s["session_id"] = make_session_id(s["title"], s["starts_at"], s["coach"])
+            sessions.append(s)
+        except Exception as e:
+            log.error(f"Block parse error {gym['id']}: {e}")
+    return sessions
+
+def upsert_session(con, gym_id, s):
+    con.execute("""
+        INSERT INTO sessions (gym_id, session_id, coach, title, starts_at, capacity)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(gym_id, session_id) DO UPDATE SET
+        coach=excluded.coach, title=excluded.title, starts_at=excluded.starts_at, capacity=excluded.capacity
+    """, (gym_id, s["session_id"], s["coach"], s["title"], s["starts_at"], s["capacity"]))
+
+def save_snapshot(con, gym_id, s):
+    con.execute("INSERT INTO snapshots (gym_id, session_id, captured_at, spots_left, is_full) VALUES (?,?,?,?,?)",
+        (gym_id, s["session_id"], datetime.utcnow().isoformat(), s["spots_left"], int(s["is_full"])))
+
+def predict_full_in_48h(con, gym_id, session_id, capacity):
+    rows = con.execute("SELECT captured_at, spots_left FROM snapshots WHERE gym_id=? AND session_id=? AND spots_left IS NOT NULL ORDER BY captured_at DESC LIMIT 50", (gym_id, session_id)).fetchall()
+    if len(rows) < 5: return False
+    now = datetime.utcnow()
+    times, spots = [], []
+    for r in rows:
+        try:
+            t = datetime.fromisoformat(r["captured_at"])
+            times.append((now - t).total_seconds() / 3600)
+            spots.append(r["spots_left"])
+        except: continue
+    if len(times) < 5: return False
+    try:
+        slope, intercept = np.polyfit(np.array(times), np.array(spots), 1)
+        if slope <= 0: return False
+        return 0 < (intercept / slope) <= 48
+    except: return False
+
+def already_alerted(con, gym_id, session_id, alert_type, within_hours=24):
+    cutoff = (datetime.utcnow() - timedelta(hours=within_hours)).isoformat()
+    return con.execute("SELECT id FROM alerts_sent WHERE gym_id=? AND session_id=? AND alert_type=? AND sent_at>?", (gym_id, session_id, alert_type, cutoff)).fetchone() is not None
+
+def record_alert(con, gym_id, session_id, alert_type):
+    con.execute("INSERT INTO alerts_sent (gym_id, session_id, alert_type, sent_at) VALUES (?,?,?,?)", (gym_id, session_id, alert_type, datetime.utcnow().isoformat()))
+
+def send_email(subject, body_html):
+    cfg = EMAIL_CONFIG
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject; msg["From"] = cfg["from"]; msg["To"] = cfg["to"]
+    msg.attach(MIMEText(body_html, "html"))
+    try:
+        with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"]) as srv:
+            srv.login(cfg["smtp_user"], cfg["smtp_password"])
+            srv.sendmail(cfg["from"], cfg["to"], msg.as_string())
+        log.info(f"Email sent: {subject}")
+    except Exception as e:
+        log.error(f"Email failed: {e}")
+
+def format_alert_email(gym_name, session, alert_type):
+    t = session.get("title","Séance"); c = session.get("coach","—"); h = session.get("starts_at","—"); sp = session.get("spots_left")
+    if alert_type == "spots_low":
+        subj = f"🚨 Plus que {sp} place(s) — {t} ({gym_name})"
+        body = f"""<div style="font-family:system-ui;max-width:500px;margin:auto">
+          <h2 style="color:#e74c3c">⚠️ Séance bientôt complète !</h2>
+          <p><strong>Salle :</strong> {gym_name} &nbsp;|&nbsp; <strong>Séance :</strong> {t}</p>
+          <p><strong>Coach :</strong> {c} &nbsp;|&nbsp; <strong>Horaire :</strong> {h}</p>
+          <p style="font-size:1.3em;color:#e74c3c"><strong>Places restantes : {sp}</strong></p>
+          <p>👉 Réserve ta place maintenant !</p></div>"""
+    else:
+        subj = f"📈 Séance prédite complète dans 48h — {t} ({gym_name})"
+        body = f"""<div style="font-family:system-ui;max-width:500px;margin:auto">
+          <h2 style="color:#e67e22">📊 Prédiction : séance complète bientôt</h2>
+          <p><strong>Salle :</strong> {gym_name} &nbsp;|&nbsp; <strong>Séance :</strong> {t}</p>
+          <p><strong>Coach :</strong> {c} &nbsp;|&nbsp; <strong>Horaire :</strong> {h}</p>
+          <p>D'après l'historique, cette séance sera <strong>complète dans &lt;48h</strong>. Réserve maintenant !</p></div>"""
+    return subj, body
+
+def run_scrape():
+    log.info("=== Scrape start ===")
+    con = get_db()
+    for gym in GYMS:
+        log.info(f"Scraping {gym['name']}")
+        for s in scrape_gym(gym):
+            upsert_session(con, gym["id"], s)
+            save_snapshot(con, gym["id"], s)
+            con.commit()
+            sid = s["session_id"]; cap = s.get("capacity") or gym.get("default_capacity")
+            sl = s.get("spots_left")
+            if sl is not None and sl <= ALERT_CONFIG["spots_threshold"]:
+                if not already_alerted(con, gym["id"], sid, "spots_low"):
+                    send_email(*format_alert_email(gym["name"], s, "spots_low"))
+                    record_alert(con, gym["id"], sid, "spots_low"); con.commit()
+            elif predict_full_in_48h(con, gym["id"], sid, cap):
+                if not already_alerted(con, gym["id"], sid, "predicted_full"):
+                    send_email(*format_alert_email(gym["name"], s, "predicted_full"))
+                    record_alert(con, gym["id"], sid, "predicted_full"); con.commit()
+    con.close(); log.info("=== Scrape done ===")
+
+app = Flask(__name__)
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gym Tracker</title>
+<style>
+*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#f0f2f5;margin:0;padding:24px}
+h1{color:#1a1a2e;margin-bottom:4px}.sub{color:#888;font-size:.88em;margin-bottom:28px}
+.gym{background:white;border-radius:14px;padding:24px;margin-bottom:24px;box-shadow:0 2px 12px rgba(0,0,0,.07)}
+.gym h2{margin:0 0 16px;color:#16213e}
+table{width:100%;border-collapse:collapse;font-size:.9em}
+th{background:#1a1a2e;color:white;padding:10px 14px;text-align:left;font-weight:500}
+td{padding:10px 14px;border-bottom:1px solid #f0f0f0}tr:last-child td{border-bottom:none}
+tr.pred{background:#fffbf0}
+.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:.82em;font-weight:600}
+.br{background:#fdecea;color:#c0392b}.bo{background:#fef3e2;color:#d35400}
+.bg{background:#eafaf1;color:#1e8449}.bx{background:#f0f0f0;color:#888}
+.sf{color:#e74c3c;font-weight:600}.so{color:#e67e22;font-weight:600}.sk{color:#27ae60}
+.upd{font-size:.78em;color:#aaa;margin-top:14px}
+.btn{display:inline-block;padding:7px 16px;background:#1a1a2e;color:white;border-radius:8px;text-decoration:none;font-size:.85em}
+</style></head><body>
+<h1>🏋️ Gym Session Tracker</h1>
+<p class="sub">Mise à jour auto toutes les heures &nbsp;·&nbsp; <a href="/scrape-now" class="btn">🔄 Actualiser</a></p>
+{% for gym in gyms %}
+<div class="gym">
+  <h2>🏢 {{ gym.name }}</h2>
+  {% if gym.sessions %}
+  <table>
+    <tr><th>Séance</th><th>Coach</th><th>Horaire</th><th>Places</th><th>Statut</th></tr>
+    {% for s in gym.sessions %}
+    <tr class="{{ 'pred' if s.predicted else '' }}">
+      <td>{{ s.title or '—' }}</td><td>{{ s.coach or '—' }}</td><td>{{ s.starts_at or '—' }}</td>
+      <td>
+        {% if s.spots_left is none %}<span class="badge bx">N/A</span>
+        {% elif s.spots_left == 0 %}<span class="badge br">Complet</span>
+        {% elif s.spots_left <= 2 %}<span class="badge bo">{{ s.spots_left }} place(s)</span>
+        {% else %}<span class="badge bg">{{ s.spots_left }}</span>{% endif %}
+      </td>
+      <td>
+        {% if s.is_full %}<span class="sf">🔴 Complet</span>
+        {% elif s.spots_left is not none and s.spots_left <= 2 %}<span class="so">🟠 Presque complet</span>
+        {% elif s.predicted %}<span class="so">📈 Complet prédit &lt;48h</span>
+        {% else %}<span class="sk">🟢 Disponible</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="upd">Dernière MAJ : {{ gym.updated }}</p>
+  {% else %}<p style="color:#999;font-style:italic">Aucune séance — vérifie config.py</p>{% endif %}
+</div>
+{% endfor %}
+</body></html>"""
+
+@app.route("/")
+def dashboard():
+    con = get_db()
+    result = []
+    for gym in GYMS:
+        rows = con.execute("""
+            SELECT s.session_id, s.title, s.coach, s.starts_at, s.capacity,
+                   sn.spots_left, sn.is_full, sn.captured_at
+            FROM sessions s
+            LEFT JOIN snapshots sn ON sn.gym_id=s.gym_id AND sn.session_id=s.session_id
+              AND sn.id=(SELECT id FROM snapshots WHERE gym_id=s.gym_id AND session_id=s.session_id ORDER BY captured_at DESC LIMIT 1)
+            WHERE s.gym_id=? ORDER BY s.starts_at
+        """, (gym["id"],)).fetchall()
+        sessions = []
+        for r in rows:
+            sessions.append({"title":r["title"],"coach":r["coach"],"starts_at":r["starts_at"],
+                "spots_left":r["spots_left"],"is_full":bool(r["is_full"]),
+                "predicted":predict_full_in_48h(con,gym["id"],r["session_id"],r["capacity"]),
+                "updated":r["captured_at"] or "—"})
+        result.append({"name":gym["name"],"sessions":sessions,"updated":sessions[0]["updated"] if sessions else "—"})
+    con.close()
+    return render_template_string(DASHBOARD_HTML, gyms=result)
+
+@app.route("/api/status")
+def api_status():
+    return jsonify({"status":"ok","time":datetime.utcnow().isoformat(),"gyms":len(GYMS)})
+
+@app.route("/scrape-now")
+def scrape_now():
+    run_scrape()
+    return "<p>✅ Scrape terminé. <a href='/'>← Dashboard</a></p>"
+
+init_db()
+run_scrape()
+scheduler = BackgroundScheduler()
+scheduler.add_job(run_scrape, "interval", hours=1, id="scrape_job")
+scheduler.start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
