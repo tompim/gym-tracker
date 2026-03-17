@@ -160,10 +160,10 @@ ALERT_CONFIG = {
 #   3. Copie les 16 caractères générés dans smtp_password ci-dessous
 
 EMAIL_CONFIG = {
-    "from": "ton_email@gmail.com",          # ← ton adresse Gmail
-    "to": "ton_email@gmail.com",            # ← où recevoir les alertes
+    "from": "tompim@gmail.com",          # ← ton adresse Gmail
+    "to": "tompim@gmail.com",            # ← où recevoir les alertes
     "smtp_host": "smtp.gmail.com",
     "smtp_port": 465,
-    "smtp_user": "ton_email@gmail.com",
-    "smtp_password": "xxxx xxxx xxxx xxxx", # ← mot de passe d'application Gmail
+    "smtp_user": "tompiml@gmail.com",
+    "smtp_password": "eupr wvii pplc vxjb", # ← mot de passe d'application Gmail
 }
