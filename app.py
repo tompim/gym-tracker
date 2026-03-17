@@ -398,9 +398,8 @@ def debug_gym(gym_id):
             page = await browser.new_page(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36"
             )
-            await page.goto(gym["url"], wait_until="networkidle", timeout=45000)
-            extra_wait = gym.get("extra_wait_ms", 3000)
-            await page.wait_for_timeout(extra_wait)
+            await page.goto(gym["url"], wait_until="load", timeout=20000)
+            await page.wait_for_timeout(3000)
             html = await page.content()
             # Count matches for the session_selector
             sel = gym.get("session_selector", "")
