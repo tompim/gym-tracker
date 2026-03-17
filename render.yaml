@@ -2,5 +2,16 @@ services:
   - type: web
     name: gym-tracker
     runtime: python
-    buildCommand: pip install -r requirements.txt && python -m playwright install chromium
+    buildCommand: pip install -r requirements.txt && python -m playwright install chromium && python -m playwright install-deps chromium
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
+    envVars:
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_TO
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: DATA_DIR
+        value: /opt/render/project/src/data

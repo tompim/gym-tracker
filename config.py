@@ -5,21 +5,23 @@ COMMENT AJOUTER UNE NOUVELLE SALLE :
   Donne-moi l'URL dans Claude, je génère le bloc automatiquement.
 
 CHAMPS DISPONIBLES PAR SALLE :
-  id                 : identifiant unique (pas d'espaces, pas d'accents)
-  name               : nom affiché
-  url                : URL du planning public
-  session_selector   : sélecteur CSS du bloc contenant UNE séance
-  wait_for_selector  : sélecteur à attendre avant de lire la page (JS loading)
-  extra_wait_ms      : millisecondes d'attente supplémentaire après chargement
-  title_selector     : sélecteur CSS du nom de la séance (dans le bloc)
-  coach_selector     : sélecteur CSS du nom du coach (dans le bloc)
-  time_selector      : sélecteur CSS de l'heure (dans le bloc)
-  spots_selector     : sélecteur CSS des places restantes (dans le bloc)
-  full_class         : classe CSS présente sur un bloc quand la séance est complète
-  default_capacity   : capacité totale si le site ne l'affiche pas
-  disabled           : True pour désactiver sans supprimer la config
-  warning            : message affiché sur le dashboard pour cette salle
+  id                   : identifiant unique (pas d'espaces, pas d'accents)
+  name                 : nom affiché
+  url                  : URL du planning public
+  session_selector     : sélecteur CSS du bloc contenant UNE séance
+  wait_for_selector    : sélecteur à attendre avant de lire la page (JS loading)
+  extra_wait_ms        : millisecondes d'attente supplémentaire après chargement
+  title_selector       : sélecteur CSS du nom de la séance (dans le bloc)
+  coach_selector       : sélecteur CSS du nom du coach (dans le bloc)
+  starts_at_selector   : sélecteur CSS de l'heure (dans le bloc)
+  spots_selector       : sélecteur CSS des places restantes (dans le bloc)
+  full_class           : classe CSS présente sur un bloc quand la séance est complète
+  default_capacity     : capacité totale si le site ne l'affiche pas
+  disabled             : True pour désactiver sans supprimer la config
+  warning              : message affiché sur le dashboard pour cette salle
 """
+
+import os
 
 GYMS = [
 
@@ -38,7 +40,7 @@ GYMS = [
         "extra_wait_ms": 3000,
         "title_selector": "[class*='title'], [class*='name'], h3, h4",
         "coach_selector": "[class*='coach'], [class*='instructor'], [class*='teacher']",
-        "time_selector": "[class*='time'], [class*='hour'], [class*='horaire'], time",
+        "starts_at_selector": "[class*='time'], [class*='hour'], [class*='horaire'], time",
         "spots_selector": "[class*='spot'], [class*='place'], [class*='avail'], [class*='remain']",
         "default_capacity": 15,
     },
@@ -58,7 +60,7 @@ GYMS = [
         "extra_wait_ms": 4000,
         "title_selector": ".class-name, .class-title, [data-testid='class-name'], h3",
         "coach_selector": ".instructor-name, .coach-name, [data-testid='instructor']",
-        "time_selector": ".class-time, .start-time, [data-testid='class-time'], time",
+        "starts_at_selector": ".class-time, .start-time, [data-testid='class-time'], time",
         "spots_selector": ".spots-remaining, .availability, [data-testid='spots']",
         "full_class": "is-full",
         "default_capacity": 20,
@@ -87,7 +89,7 @@ GYMS = [
         "extra_wait_ms": 5000,
         "title_selector": "[class*='ClassName'], [class*='class-name'], [class*='ClassTitle'], h3, h4",
         "coach_selector": "[class*='InstructorName'], [class*='instructor'], [class*='coach'], [class*='Staff']",
-        "time_selector": "[class*='ClassTime'], [class*='StartTime'], [class*='time'], time",
+        "starts_at_selector": "[class*='ClassTime'], [class*='StartTime'], [class*='time'], time",
         "spots_selector": "[class*='Spots'], [class*='spots'], [class*='Availability'], [class*='availability']",
         "full_class": "full",
         "default_capacity": 6,   # Paris 17 : 6 Megareformers
@@ -109,7 +111,7 @@ GYMS = [
         "extra_wait_ms": 5000,
         "title_selector": "[class*='ClassName'], [class*='class-name'], [class*='ClassTitle'], h3, h4",
         "coach_selector": "[class*='InstructorName'], [class*='instructor'], [class*='coach'], [class*='Staff']",
-        "time_selector": "[class*='ClassTime'], [class*='StartTime'], [class*='time'], time",
+        "starts_at_selector": "[class*='ClassTime'], [class*='StartTime'], [class*='time'], time",
         "spots_selector": "[class*='Spots'], [class*='spots'], [class*='Availability'], [class*='availability']",
         "full_class": "full",
         "default_capacity": 10,  # Paris 3 : 10 Megapro
@@ -138,7 +140,7 @@ GYMS = [
         "extra_wait_ms": 5000,
         "title_selector": "[class*='name'], [class*='title'], .class-name, h3, h4",
         "coach_selector": "[class*='coach'], [class*='instructor'], .coach",
-        "time_selector": "[class*='time'], [class*='hour'], .start-time, time",
+        "starts_at_selector": "[class*='time'], [class*='hour'], .start-time, time",
         "spots_selector": "[class*='spot'], [class*='place'], [class*='avail']",
         "full_class": "is-full",
         "default_capacity": 20,
@@ -160,10 +162,10 @@ ALERT_CONFIG = {
 #   3. Copie les 16 caractères générés dans smtp_password ci-dessous
 
 EMAIL_CONFIG = {
-    "from": "ton_email@gmail.com",          # ← ton adresse Gmail
-    "to": "ton_email@gmail.com",            # ← où recevoir les alertes
-    "smtp_host": "smtp.gmail.com",
-    "smtp_port": 465,
-    "smtp_user": "ton_email@gmail.com",
-    "smtp_password": "xxxx xxxx xxxx xxxx", # ← mot de passe d'application Gmail
+    "from": os.environ.get("EMAIL_FROM", "ton_email@gmail.com"),
+    "to": os.environ.get("EMAIL_TO", "ton_email@gmail.com"),
+    "smtp_host": os.environ.get("SMTP_HOST", "smtp.gmail.com"),
+    "smtp_port": int(os.environ.get("SMTP_PORT", "465")),
+    "smtp_user": os.environ.get("SMTP_USER", "ton_email@gmail.com"),
+    "smtp_password": os.environ.get("SMTP_PASSWORD", ""),
 }

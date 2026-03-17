@@ -386,12 +386,16 @@ def scrape_now():
     return "<p>✅ Scrape terminé. <a href='/'>← Dashboard</a></p>"
 
 # ── Startup ───────────────────────────────────────────────────────────────────
+import threading
+
 init_db()
-run_scrape()
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(run_scrape, "interval", hours=1, id="scrape_job")
 scheduler.start()
+
+# Run first scrape in background so Gunicorn can start without timing out
+threading.Thread(target=run_scrape, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
