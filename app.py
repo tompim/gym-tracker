@@ -24,7 +24,7 @@ from config import GYMS, EMAIL_CONFIG, ALERT_CONFIG
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/render/project/src"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "gym_tracker.db"
 
