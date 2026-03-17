@@ -385,6 +385,59 @@ def scrape_now():
     run_scrape()
     return "<p>✅ Scrape terminé. <a href='/'>← Dashboard</a></p>"
 
+@app.route("/debug/<gym_id>")
+def debug_gym(gym_id):
+    """Render the gym page with Playwright and return the HTML source + selector matches."""
+    gym = next((g for g in GYMS if g["id"] == gym_id), None)
+    if not gym:
+        return f"<p>Gym '{gym_id}' not found. Available: {[g['id'] for g in GYMS]}</p>", 404
+
+    async def _fetch():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = await browser.new_page(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36"
+            )
+            await page.goto(gym["url"], wait_until="networkidle", timeout=45000)
+            extra_wait = gym.get("extra_wait_ms", 3000)
+            await page.wait_for_timeout(extra_wait)
+            html = await page.content()
+            # Count matches for the session_selector
+            sel = gym.get("session_selector", "")
+            count = await page.evaluate(f"() => document.querySelectorAll(`{sel}`).length")
+            # Get first 3 blocks' outerHTML for inspection
+            blocks_html = await page.evaluate(f"""() => {{
+                const els = document.querySelectorAll(`{sel}`);
+                return Array.from(els).slice(0, 3).map(e => e.outerHTML);
+            }}""")
+            await browser.close()
+            return html, count, blocks_html
+
+    try:
+        html, count, blocks_html = asyncio.run(_fetch())
+    except Exception as e:
+        return f"<pre>Error: {e}</pre>", 500
+
+    # Truncate full HTML to 20 000 chars to stay readable
+    html_snippet = html[:20000]
+    blocks_section = ""
+    for i, b in enumerate(blocks_html):
+        blocks_section += f"<h3>Block {i+1}</h3><pre style='white-space:pre-wrap;word-break:break-all;background:#f5f5f5;padding:12px'>{b[:3000]}</pre>"
+
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>
+<title>Debug — {gym['name']}</title>
+<style>body{{font-family:system-ui;padding:24px;max-width:1100px;margin:auto}}
+pre{{background:#f5f5f5;padding:12px;overflow-x:auto;font-size:.8em}}
+h2{{color:#1a1a2e}}.ok{{color:green}}.ko{{color:red}}</style></head><body>
+<h1>🔍 Debug — {gym['name']}</h1>
+<p><a href='/'>← Dashboard</a> &nbsp;|&nbsp; <strong>URL :</strong> {gym['url']}</p>
+<p><strong>session_selector :</strong> <code>{gym.get('session_selector','')}</code></p>
+<p class='{'ok' if count > 0 else 'ko'}'><strong>Blocs trouvés : {count}</strong></p>
+{blocks_section if count > 0 else "<p class='ko'>Aucun bloc — les sélecteurs ne correspondent pas au DOM rendu.</p>"}
+<h2>HTML rendu (20 000 premiers caractères)</h2>
+<pre>{html_snippet.replace('<','&lt;').replace('>','&gt;')}</pre>
+</body></html>"""
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 import threading
 
